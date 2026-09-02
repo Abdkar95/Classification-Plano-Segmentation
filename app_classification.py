@@ -279,9 +279,19 @@ if df_majoritaire is not None:
         plano_col = st.selectbox("Colonne Plano (brut)", df_plan.columns, key="plano_col")
         seg_col = st.selectbox("Colonne Segmentation (brut)", df_plan.columns, key="seg_col")
 
-        df_plan_work = df_plan[[id_col, plano_col, seg_col]].rename(
-            columns={id_col: "ID/DBkey", plano_col: "Plano", seg_col: "Segmentation"}
-        )
+        if len({id_col, plano_col, seg_col}) < 3:
+            st.warning("Les colonnes ID/DBkey, Plano et Segmentation doivent être distinctes.")
+
+        # Construction par VALEURS (et non par renommage de noms de colonnes) :
+        # si deux selectbox pointent vers la même colonne source, un .rename(columns={...})
+        # écrase silencieusement une des entrées du dict (clés dupliquées), ce qui faisait
+        # disparaître "Plano" ou "Segmentation" du DataFrame -> KeyError plus loin sur
+        # drop_duplicates(subset=[...]). Cette construction est robuste à ce cas.
+        df_plan_work = pd.DataFrame({
+            "ID/DBkey": df_plan[id_col].values,
+            "Plano": df_plan[plano_col].values,
+            "Segmentation": df_plan[seg_col].values,
+        })
 
         if f_correspondance is not None:
             df_corr = read_excel_sheet(f_correspondance, sheet_hint="correspondance")
@@ -293,14 +303,18 @@ if df_majoritaire is not None:
             corr_plano_norm = st.selectbox("Colonne Plano normalisé (correspondance)", df_corr.columns, key="corr_plano_norm")
             corr_seg_norm = st.selectbox("Colonne Segmentation normalisée (correspondance)", df_corr.columns, key="corr_seg_norm")
 
-            df_corr_work = df_corr[[corr_plano_brut, corr_seg_brut, corr_plano_norm, corr_seg_norm]].rename(
-                columns={
-                    corr_plano_brut: "Plano",
-                    corr_seg_brut: "Segmentation",
-                    corr_plano_norm: "Plano grouping desc",
-                    corr_seg_norm: "Segmentation.1",
-                }
-            )
+            if len({corr_plano_brut, corr_seg_brut, corr_plano_norm, corr_seg_norm}) < 4:
+                st.warning(
+                    "Les 4 colonnes de correspondance (Plano brut, Segmentation brut, "
+                    "Plano normalisé, Segmentation normalisée) doivent être distinctes."
+                )
+
+            df_corr_work = pd.DataFrame({
+                "Plano": df_corr[corr_plano_brut].values,
+                "Segmentation": df_corr[corr_seg_brut].values,
+                "Plano grouping desc": df_corr[corr_plano_norm].values,
+                "Segmentation.1": df_corr[corr_seg_norm].values,
+            })
             df_corr_work = df_corr_work.drop_duplicates(subset=["Plano", "Segmentation"])
 
             # Normalisation des clés brutes avant jointure (espaces/casse fréquents entre exports)

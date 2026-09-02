@@ -252,22 +252,64 @@ if df_enrichi is not None:
         )
 
 # ============================================================
-# ÉTAPE 4 — Report sur le Plan de sol
+# ÉTAPE 3bis — Validation de la classification (aucun vide / "Non défini")
 # ============================================================
 if df_majoritaire is not None:
+    st.header("3bis. Validation de la classification")
+
+    mask_probleme = (
+        df_majoritaire["Code qualification"].isna()
+        | df_majoritaire["Qualification"].isna()
+        | df_majoritaire["Éligibilité"].isna()
+        | (df_majoritaire["Éligibilité"] == "Non défini")
+    )
+    lignes_a_corriger = df_majoritaire.loc[mask_probleme]
+
+    if lignes_a_corriger.empty:
+        st.success("Aucune valeur manquante ni « Non défini » : la classification est prête.")
+        st.session_state["df_majoritaire_validee"] = df_majoritaire.copy()
+        st.session_state["classification_ok"] = True
+    else:
+        st.warning(
+            f"{len(lignes_a_corriger)} couple(s) Plano/Segmentation ont une classification incomplète "
+            "(valeur manquante ou « Non défini »). Corrigez-les directement dans le tableau ci-dessous "
+            "puis validez avant de poursuivre."
+        )
+        edite = st.data_editor(
+            lignes_a_corriger[["Plano grouping desc", "Segmentation", "Code qualification", "Qualification", "Éligibilité"]],
+            use_container_width=True,
+            num_rows="fixed",
+            key="editeur_classification",
+        )
+        if st.button("Valider la classification corrigée"):
+            reste_vide = (
+                edite["Code qualification"].isna() | (edite["Code qualification"].astype(str).str.strip() == "")
+                | edite["Qualification"].isna() | (edite["Qualification"].astype(str).str.strip() == "")
+                | edite["Éligibilité"].isna() | (edite["Éligibilité"].astype(str).str.strip().isin(["", "Non défini"]))
+            )
+            if reste_vide.any():
+                st.error(
+                    f"{int(reste_vide.sum())} ligne(s) encore incomplète(s) ou toujours à « Non défini ». "
+                    "Complétez-les avant de valider."
+                )
+            else:
+                df_majoritaire_corrige = df_majoritaire.copy()
+                df_majoritaire_corrige = df_majoritaire_corrige.set_index(["Plano grouping desc", "Segmentation"])
+                df_majoritaire_corrige.update(edite.set_index(["Plano grouping desc", "Segmentation"]))
+                df_majoritaire_corrige = df_majoritaire_corrige.reset_index()
+                st.session_state["df_majoritaire_validee"] = df_majoritaire_corrige
+                st.session_state["classification_ok"] = True
+                st.success("Classification corrigée et validée.")
+
+# ============================================================
+# ÉTAPE 4 — Génération et validation de la table de correspondance, puis report
+# ============================================================
+if st.session_state.get("classification_ok"):
+    df_ref = st.session_state["df_majoritaire_validee"]
+
     st.header("4. Report sur le Plan de sol")
 
-    st.info(
-        "Les libellés Plano/Segmentation du plan de sol brut sont souvent écrits différemment "
-        "de ceux des articles (ex. « ACCESSOIRES PLACO » vs « ALARA EXPO »). "
-        "Si c'est votre cas, fournissez aussi un fichier de correspondance "
-        "(brut → normalisé), sinon la jointure se fera directement sur les libellés."
-    )
-
     f_plan = st.file_uploader("Fichier Plan de sol (ID/DBkey, Plano, Segmentation)", type=["xlsx"], key="plan")
-    f_correspondance = st.file_uploader(
-        "Fichier de correspondance Plano/Segmentation brut → normalisé (optionnel)", type=["xlsx"], key="correspondance"
-    )
 
     if f_plan is not None:
         df_plan = read_excel_sheet(f_plan, sheet_hint="plan")
@@ -282,176 +324,168 @@ if df_majoritaire is not None:
         if len({id_col, plano_col, seg_col}) < 3:
             st.warning("Les colonnes ID/DBkey, Plano et Segmentation doivent être distinctes.")
 
-        # Construction par VALEURS (et non par renommage de noms de colonnes) :
-        # si deux selectbox pointent vers la même colonne source, un .rename(columns={...})
-        # écrase silencieusement une des entrées du dict (clés dupliquées), ce qui faisait
-        # disparaître "Plano" ou "Segmentation" du DataFrame -> KeyError plus loin sur
-        # drop_duplicates(subset=[...]). Cette construction est robuste à ce cas.
         df_plan_work = pd.DataFrame({
             "ID/DBkey": df_plan[id_col].values,
             "Plano": df_plan[plano_col].values,
             "Segmentation": df_plan[seg_col].values,
         })
 
-        if f_correspondance is not None:
-            df_corr = read_excel_sheet(f_correspondance, sheet_hint="correspondance")
-            with st.expander("Aperçu de la table de correspondance"):
-                st.dataframe(df_corr.head(20), use_container_width=True)
-
-            corr_plano_brut = st.selectbox("Colonne Plano brut (correspondance)", df_corr.columns, key="corr_plano_brut")
-            corr_seg_brut = st.selectbox("Colonne Segmentation brut (correspondance)", df_corr.columns, key="corr_seg_brut")
-            corr_plano_norm = st.selectbox("Colonne Plano normalisé (correspondance)", df_corr.columns, key="corr_plano_norm")
-            corr_seg_norm = st.selectbox("Colonne Segmentation normalisée (correspondance)", df_corr.columns, key="corr_seg_norm")
-
-            if len({corr_plano_brut, corr_seg_brut, corr_plano_norm, corr_seg_norm}) < 4:
-                st.warning(
-                    "Les 4 colonnes de correspondance (Plano brut, Segmentation brut, "
-                    "Plano normalisé, Segmentation normalisée) doivent être distinctes."
-                )
-
-            df_corr_work = pd.DataFrame({
-                "Plano": df_corr[corr_plano_brut].values,
-                "Segmentation": df_corr[corr_seg_brut].values,
-                "Plano grouping desc": df_corr[corr_plano_norm].values,
-                "Segmentation.1": df_corr[corr_seg_norm].values,
-            })
-            df_corr_work = df_corr_work.drop_duplicates(subset=["Plano", "Segmentation"])
-
-            # Normalisation des clés brutes avant jointure (espaces/casse fréquents entre exports)
-            df_plan_work["_Plano_key"] = normalize_key(df_plan_work["Plano"])
-            df_plan_work["_Seg_key"] = normalize_key(df_plan_work["Segmentation"])
-            df_corr_work["_Plano_key"] = normalize_key(df_corr_work["Plano"])
-            df_corr_work["_Seg_key"] = normalize_key(df_corr_work["Segmentation"])
-
-            df_plan_norm = df_plan_work.merge(
-                df_corr_work[["_Plano_key", "_Seg_key", "Plano grouping desc", "Segmentation.1"]],
-                on=["_Plano_key", "_Seg_key"], how="left",
-            ).drop(columns=["_Plano_key", "_Seg_key"])
-
-            nb_non_normalises = df_plan_norm["Plano grouping desc"].isna().sum()
-            if nb_non_normalises > 0:
-                st.warning(
-                    f"{nb_non_normalises} ligne(s) du plan de sol sans correspondance dans la table "
-                    "de normalisation Plano/Segmentation."
-                )
-        else:
-            df_plan_norm = df_plan_work.copy()
-            df_plan_norm["Plano grouping desc"] = df_plan_norm["Plano"]
-            df_plan_norm["Segmentation.1"] = df_plan_norm["Segmentation"]
-
         # --------------------------------------------------------------
-        # 4bis. Corrections manuelles des couples Plano/Segmentation
+        # 4bis. Génération automatique de la table de correspondance
         # --------------------------------------------------------------
-        st.subheader("4bis. Corrections manuelles (optionnel)")
+        st.subheader("4bis. Table de correspondance (générée automatiquement)")
+        st.markdown(
+            """
+Pour chaque couple **Plano + Segmentation** unique du plan de sol, l'application cherche une
+correspondance dans la classification validée (étape 3bis), dans cet ordre :
 
-        df_plan_norm["_Plano_key"] = normalize_key(df_plan_norm["Plano grouping desc"])
-        df_plan_norm["_Seg_key"] = normalize_key(df_plan_norm["Segmentation.1"])
-
-        df_majoritaire["_Plano_key"] = normalize_key(df_majoritaire["Plano grouping desc"])
-        df_majoritaire["_Seg_key"] = normalize_key(df_majoritaire["Segmentation"])
-
-        # Couples uniques du plan de sol absents de la classification automatique (étape 3)
-        couples_plan = df_plan_norm[["Plano grouping desc", "Segmentation.1", "_Plano_key", "_Seg_key"]].drop_duplicates(
-            subset=["_Plano_key", "_Seg_key"]
+1. Correspondance exacte **Plano + Segmentation**
+2. Correspondance sur la **Segmentation seule** (si un seul candidat possible)
+3. Correspondance entre le **Plano du plan de sol et la Segmentation de la classification**
+4. Correspondance sur le **Plano seul** (si un seul candidat possible)
+5. Si rien n'est trouvé (ou si plusieurs candidats sont possibles), la ligne reste à compléter à la main.
+"""
         )
-        couples_manquants = couples_plan.loc[
-            ~couples_plan.set_index(["_Plano_key", "_Seg_key"]).index.isin(
-                df_majoritaire.set_index(["_Plano_key", "_Seg_key"]).index
-            )
-        ]
 
-        if not couples_manquants.empty:
-            gabarit = couples_manquants[["Plano grouping desc", "Segmentation.1"]].rename(
-                columns={"Segmentation.1": "Segmentation"}
+        def normalize_label(series):
+            """Normalisation d'un libellé pour une comparaison insensible à la casse/aux espaces."""
+            return series.astype(str).str.strip().str.upper()
+
+        def generer_correspondance_auto(couples_plan, df_ref_local):
+            df_ref_local = df_ref_local.copy()
+            df_ref_local["_Plano_n"] = normalize_label(df_ref_local["Plano grouping desc"])
+            df_ref_local["_Seg_n"] = normalize_label(df_ref_local["Segmentation"])
+
+            lignes = []
+            for _, row in couples_plan.iterrows():
+                plano_p, seg_p = row["Plano"], row["Segmentation"]
+                plano_pn = normalize_label(pd.Series([plano_p])).iloc[0]
+                seg_pn = normalize_label(pd.Series([seg_p])).iloc[0]
+
+                match, methode = None, "Non trouvé — à compléter manuellement"
+
+                cand = df_ref_local[(df_ref_local["_Plano_n"] == plano_pn) & (df_ref_local["_Seg_n"] == seg_pn)]
+                if len(cand) >= 1:
+                    match, methode = cand.iloc[0], "Exact (Plano + Segmentation)"
+                else:
+                    cand = df_ref_local[df_ref_local["_Seg_n"] == seg_pn]
+                    if len(cand) == 1:
+                        match, methode = cand.iloc[0], "Segmentation seule"
+                    elif len(cand) > 1:
+                        methode = "Ambigu (Segmentation seule) — à compléter manuellement"
+                    else:
+                        cand = df_ref_local[df_ref_local["_Seg_n"] == plano_pn]
+                        if len(cand) == 1:
+                            match, methode = cand.iloc[0], "Plano (plan) ↔ Segmentation (classification)"
+                        elif len(cand) > 1:
+                            methode = "Ambigu (Plano plan ↔ Segmentation classification) — à compléter manuellement"
+                        else:
+                            cand = df_ref_local[df_ref_local["_Plano_n"] == plano_pn]
+                            if len(cand) == 1:
+                                match, methode = cand.iloc[0], "Plano seul"
+                            elif len(cand) > 1:
+                                methode = "Ambigu (Plano seul) — à compléter manuellement"
+
+                if match is not None:
+                    lignes.append({
+                        "Plano (plan de sol)": plano_p,
+                        "Segmentation (plan de sol)": seg_p,
+                        "Plano grouping desc": match["Plano grouping desc"],
+                        "Segmentation.1": match["Segmentation"],
+                        "Code qualification": match["Code qualification"],
+                        "Qualification": match["Qualification"],
+                        "Éligibilité": match["Éligibilité"],
+                        "Méthode": methode,
+                    })
+                else:
+                    lignes.append({
+                        "Plano (plan de sol)": plano_p,
+                        "Segmentation (plan de sol)": seg_p,
+                        "Plano grouping desc": "",
+                        "Segmentation.1": "",
+                        "Code qualification": "",
+                        "Qualification": "",
+                        "Éligibilité": "",
+                        "Méthode": methode,
+                    })
+            return pd.DataFrame(lignes)
+
+        couples_plan_uniques = df_plan_work[["Plano", "Segmentation"]].drop_duplicates().reset_index(drop=True)
+
+        cle_cache = (len(couples_plan_uniques), len(df_ref), tuple(df_ref["Plano grouping desc"].head(3)))
+        if st.session_state.get("_cle_cache_correspondance") != cle_cache:
+            st.session_state["df_correspondance_auto"] = generer_correspondance_auto(
+                couples_plan_uniques,
+                df_ref[["Plano grouping desc", "Segmentation", "Code qualification", "Qualification", "Éligibilité"]],
             )
-            gabarit["Code qualification"] = ""
-            gabarit["Qualification"] = ""
-            gabarit["Éligibilité"] = ""
+            st.session_state["_cle_cache_correspondance"] = cle_cache
+            # Une nouvelle génération invalide une éventuelle validation précédente
+            st.session_state["correspondance_ok"] = False
+
+        df_correspondance_auto = st.session_state["df_correspondance_auto"]
+
+        nb_a_completer = (df_correspondance_auto["Code qualification"].astype(str).str.strip() == "").sum()
+        if nb_a_completer > 0:
             st.warning(
-                f"{len(gabarit)} couple(s) Plano/Segmentation du plan de sol n'ont pas trouvé de "
-                "classification automatique. Téléchargez le gabarit ci-dessous, remplissez les 3 "
-                "dernières colonnes, puis réimportez-le juste en dessous pour les compléter."
+                f"{nb_a_completer} couple(s) sur {len(df_correspondance_auto)} n'ont pas trouvé de "
+                "correspondance automatique (colonne « Méthode »). Complétez-les dans le tableau ci-dessous."
             )
+        else:
+            st.success(f"Les {len(df_correspondance_auto)} couples du plan de sol ont tous trouvé une correspondance.")
+
+        correspondance_editee = st.data_editor(
+            df_correspondance_auto,
+            use_container_width=True,
+            num_rows="fixed",
+            key="editeur_correspondance",
+            disabled=["Plano (plan de sol)", "Segmentation (plan de sol)", "Méthode"],
+        )
+
+        if st.button("Valider la table de correspondance"):
+            encore_vide = correspondance_editee["Code qualification"].astype(str).str.strip() == ""
+            if encore_vide.any():
+                st.error(
+                    f"{int(encore_vide.sum())} ligne(s) encore incomplète(s). "
+                    "Remplissez « Plano grouping desc », « Segmentation.1 », « Code qualification », "
+                    "« Qualification » et « Éligibilité » pour toutes les lignes avant de valider."
+                )
+            else:
+                st.session_state["df_correspondance_validee"] = correspondance_editee.copy()
+                st.session_state["correspondance_ok"] = True
+                st.session_state["df_plan_work"] = df_plan_work
+                st.success("Table de correspondance validée.")
+
+        # --------------------------------------------------------------
+        # 4ter. Jointure finale sur le plan de sol
+        # --------------------------------------------------------------
+        if st.session_state.get("correspondance_ok"):
+            df_correspondance_validee = st.session_state["df_correspondance_validee"]
+            df_plan_work_valide = st.session_state["df_plan_work"]
+
+            df_plan_work_valide["_Plano_key"] = normalize_key(df_plan_work_valide["Plano"])
+            df_plan_work_valide["_Seg_key"] = normalize_key(df_plan_work_valide["Segmentation"])
+
+            df_corr_key = df_correspondance_validee.rename(
+                columns={"Plano (plan de sol)": "Plano", "Segmentation (plan de sol)": "Segmentation"}
+            )
+            df_corr_key["_Plano_key"] = normalize_key(df_corr_key["Plano"])
+            df_corr_key["_Seg_key"] = normalize_key(df_corr_key["Segmentation"])
+
+            df_final = df_plan_work_valide.merge(
+                df_corr_key[["_Plano_key", "_Seg_key", "Code qualification", "Qualification", "Éligibilité"]],
+                on=["_Plano_key", "_Seg_key"], how="left",
+            )
+
+            df_final_out = df_final[
+                ["ID/DBkey", "Plano", "Segmentation", "Code qualification", "Qualification", "Éligibilité"]
+            ]
+
+            st.subheader("Résultat final")
+            st.success(f"Résultat final : {len(df_final_out)} lignes")
+            st.dataframe(df_final_out, use_container_width=True)
             st.download_button(
-                "Télécharger le gabarit des couples non classifiés (CSV)",
-                gabarit.to_csv(index=False).encode("utf-8-sig"),
-                file_name="gabarit_corrections.csv",
+                "Télécharger le résultat final (CSV)",
+                df_final_out.to_csv(index=False).encode("utf-8-sig"),
+                file_name="plan_de_sol_classifie.csv",
                 mime="text/csv",
             )
-        else:
-            st.success("Tous les couples Plano/Segmentation du plan de sol ont une classification automatique.")
-
-        f_corrections = st.file_uploader(
-            "Fichier de corrections manuelles (Plano grouping desc, Segmentation, Code qualification, "
-            "Qualification, Éligibilité)",
-            type=["xlsx", "csv"], key="corrections",
-        )
-
-        if f_corrections is not None:
-            if f_corrections.name.lower().endswith(".csv"):
-                df_corrections = pd.read_csv(f_corrections)
-                df_corrections.columns = [str(c).strip() for c in df_corrections.columns]
-            else:
-                df_corrections = read_excel_sheet(f_corrections, sheet_hint="correction")
-
-            required_corr_cols = ["Plano grouping desc", "Segmentation", "Code qualification", "Qualification", "Éligibilité"]
-            if check_columns(df_corrections, required_corr_cols, "Corrections manuelles"):
-                # On ignore les lignes qui n'ont pas été remplies (Code qualification vide)
-                df_corrections = df_corrections[df_corrections["Code qualification"].notna()]
-                df_corrections = df_corrections[df_corrections["Code qualification"].astype(str).str.strip() != ""]
-
-                df_corrections["_Plano_key"] = normalize_key(df_corrections["Plano grouping desc"])
-                df_corrections["_Seg_key"] = normalize_key(df_corrections["Segmentation"])
-                df_corrections = df_corrections.drop_duplicates(subset=["_Plano_key", "_Seg_key"], keep="last")
-
-                df_maj_idx = df_majoritaire.set_index(["_Plano_key", "_Seg_key"])
-                df_corr_idx = df_corrections.set_index(["_Plano_key", "_Seg_key"])
-
-                # Écrase les couples déjà connus (correction d'une classification existante)
-                cols_a_corriger = ["Code qualification", "Qualification", "Éligibilité"]
-                df_maj_idx.update(df_corr_idx[cols_a_corriger])
-
-                # Ajoute les couples totalement absents de la classification automatique
-                nouveaux = df_corr_idx.loc[~df_corr_idx.index.isin(df_maj_idx.index)]
-                df_majoritaire = pd.concat(
-                    [
-                        df_maj_idx.reset_index(),
-                        nouveaux.reset_index()[
-                            ["_Plano_key", "_Seg_key", "Plano grouping desc", "Segmentation"] + cols_a_corriger
-                        ],
-                    ],
-                    ignore_index=True,
-                )
-                st.success(f"{len(df_corrections)} correction(s) appliquée(s) à la classification.")
-
-        # Jointure finale avec la classification majoritaire — corrigée le cas échéant (clés normalisées)
-        df_majoritaire_key = df_majoritaire.copy()
-        if "_Plano_key" not in df_majoritaire_key.columns:
-            df_majoritaire_key["_Plano_key"] = normalize_key(df_majoritaire_key["Plano grouping desc"])
-            df_majoritaire_key["_Seg_key"] = normalize_key(df_majoritaire_key["Segmentation"])
-
-        df_final = df_plan_norm.merge(
-            df_majoritaire_key[["_Plano_key", "_Seg_key", "Code qualification", "Qualification", "Éligibilité"]],
-            on=["_Plano_key", "_Seg_key"],
-            how="left",
-        )
-
-        df_final_out = df_final[
-            ["ID/DBkey", "Plano", "Segmentation", "Code qualification", "Qualification", "Éligibilité"]
-        ]
-
-        nb_non_trouves = df_final_out["Code qualification"].isna().sum()
-        if nb_non_trouves > 0:
-            st.warning(
-                f"{nb_non_trouves} ligne(s) du plan de sol n'ont pas trouvé de classification "
-                "(Plano/Segmentation absent de la classification des articles)."
-            )
-
-        st.success(f"Résultat final : {len(df_final_out)} lignes")
-        st.dataframe(df_final_out, use_container_width=True)
-        st.download_button(
-            "Télécharger le résultat final (CSV)",
-            df_final_out.to_csv(index=False).encode("utf-8-sig"),
-            file_name="plan_de_sol_classifie.csv",
-            mime="text/csv",
-        )

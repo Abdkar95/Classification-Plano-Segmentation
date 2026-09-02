@@ -1,0 +1,11 @@
+pyautogui
+openpyxl
+pyperclip
+pandas
+rapidfuzz
+pyautogui
+pyperclip
+pywinauto
+Workbook
+xlsxwriter
+streamlit

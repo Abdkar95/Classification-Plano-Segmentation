@@ -339,13 +339,96 @@ if df_majoritaire is not None:
             df_plan_norm["Plano grouping desc"] = df_plan_norm["Plano"]
             df_plan_norm["Segmentation.1"] = df_plan_norm["Segmentation"]
 
-        # Jointure finale avec la classification majoritaire (clés normalisées)
+        # --------------------------------------------------------------
+        # 4bis. Corrections manuelles des couples Plano/Segmentation
+        # --------------------------------------------------------------
+        st.subheader("4bis. Corrections manuelles (optionnel)")
+
         df_plan_norm["_Plano_key"] = normalize_key(df_plan_norm["Plano grouping desc"])
         df_plan_norm["_Seg_key"] = normalize_key(df_plan_norm["Segmentation.1"])
 
+        df_majoritaire["_Plano_key"] = normalize_key(df_majoritaire["Plano grouping desc"])
+        df_majoritaire["_Seg_key"] = normalize_key(df_majoritaire["Segmentation"])
+
+        # Couples uniques du plan de sol absents de la classification automatique (étape 3)
+        couples_plan = df_plan_norm[["Plano grouping desc", "Segmentation.1", "_Plano_key", "_Seg_key"]].drop_duplicates(
+            subset=["_Plano_key", "_Seg_key"]
+        )
+        couples_manquants = couples_plan.loc[
+            ~couples_plan.set_index(["_Plano_key", "_Seg_key"]).index.isin(
+                df_majoritaire.set_index(["_Plano_key", "_Seg_key"]).index
+            )
+        ]
+
+        if not couples_manquants.empty:
+            gabarit = couples_manquants[["Plano grouping desc", "Segmentation.1"]].rename(
+                columns={"Segmentation.1": "Segmentation"}
+            )
+            gabarit["Code qualification"] = ""
+            gabarit["Qualification"] = ""
+            gabarit["Éligibilité"] = ""
+            st.warning(
+                f"{len(gabarit)} couple(s) Plano/Segmentation du plan de sol n'ont pas trouvé de "
+                "classification automatique. Téléchargez le gabarit ci-dessous, remplissez les 3 "
+                "dernières colonnes, puis réimportez-le juste en dessous pour les compléter."
+            )
+            st.download_button(
+                "Télécharger le gabarit des couples non classifiés (CSV)",
+                gabarit.to_csv(index=False).encode("utf-8-sig"),
+                file_name="gabarit_corrections.csv",
+                mime="text/csv",
+            )
+        else:
+            st.success("Tous les couples Plano/Segmentation du plan de sol ont une classification automatique.")
+
+        f_corrections = st.file_uploader(
+            "Fichier de corrections manuelles (Plano grouping desc, Segmentation, Code qualification, "
+            "Qualification, Éligibilité)",
+            type=["xlsx", "csv"], key="corrections",
+        )
+
+        if f_corrections is not None:
+            if f_corrections.name.lower().endswith(".csv"):
+                df_corrections = pd.read_csv(f_corrections)
+                df_corrections.columns = [str(c).strip() for c in df_corrections.columns]
+            else:
+                df_corrections = read_excel_sheet(f_corrections, sheet_hint="correction")
+
+            required_corr_cols = ["Plano grouping desc", "Segmentation", "Code qualification", "Qualification", "Éligibilité"]
+            if check_columns(df_corrections, required_corr_cols, "Corrections manuelles"):
+                # On ignore les lignes qui n'ont pas été remplies (Code qualification vide)
+                df_corrections = df_corrections[df_corrections["Code qualification"].notna()]
+                df_corrections = df_corrections[df_corrections["Code qualification"].astype(str).str.strip() != ""]
+
+                df_corrections["_Plano_key"] = normalize_key(df_corrections["Plano grouping desc"])
+                df_corrections["_Seg_key"] = normalize_key(df_corrections["Segmentation"])
+                df_corrections = df_corrections.drop_duplicates(subset=["_Plano_key", "_Seg_key"], keep="last")
+
+                df_maj_idx = df_majoritaire.set_index(["_Plano_key", "_Seg_key"])
+                df_corr_idx = df_corrections.set_index(["_Plano_key", "_Seg_key"])
+
+                # Écrase les couples déjà connus (correction d'une classification existante)
+                cols_a_corriger = ["Code qualification", "Qualification", "Éligibilité"]
+                df_maj_idx.update(df_corr_idx[cols_a_corriger])
+
+                # Ajoute les couples totalement absents de la classification automatique
+                nouveaux = df_corr_idx.loc[~df_corr_idx.index.isin(df_maj_idx.index)]
+                df_majoritaire = pd.concat(
+                    [
+                        df_maj_idx.reset_index(),
+                        nouveaux.reset_index()[
+                            ["_Plano_key", "_Seg_key", "Plano grouping desc", "Segmentation"] + cols_a_corriger
+                        ],
+                    ],
+                    ignore_index=True,
+                )
+                st.success(f"{len(df_corrections)} correction(s) appliquée(s) à la classification.")
+
+        # Jointure finale avec la classification majoritaire — corrigée le cas échéant (clés normalisées)
         df_majoritaire_key = df_majoritaire.copy()
-        df_majoritaire_key["_Plano_key"] = normalize_key(df_majoritaire_key["Plano grouping desc"])
-        df_majoritaire_key["_Seg_key"] = normalize_key(df_majoritaire_key["Segmentation"])
+        if "_Plano_key" not in df_majoritaire_key.columns:
+            df_majoritaire_key["_Plano_key"] = normalize_key(df_majoritaire_key["Plano grouping desc"])
+            df_majoritaire_key["_Seg_key"] = normalize_key(df_majoritaire_key["Segmentation"])
 
         df_final = df_plan_norm.merge(
             df_majoritaire_key[["_Plano_key", "_Seg_key", "Code qualification", "Qualification", "Éligibilité"]],

@@ -59,6 +59,19 @@ def check_columns(df, required_cols, label):
     return True
 
 
+def normalize_key(series):
+    """
+    Normalise une colonne servant de clé de jointure : force en texte,
+    supprime les espaces superflus, retire un éventuel '.0' issu d'une
+    lecture Excel qui a interprété un ID numérique comme un float.
+    Évite les jointures silencieusement vides à cause d'un type ou
+    d'un espace différent entre deux fichiers.
+    """
+    s = series.astype(str).str.strip()
+    s = s.str.replace(r"\.0$", "", regex=True)
+    return s
+
+
 # ============================================================
 # ÉTAPE 1 — Chargement des fichiers articles
 # ============================================================
@@ -110,34 +123,62 @@ if articles_ready:
     ok &= check_columns(df_qualif, ["CODE_FAM", "CODE_SFAM", "FAM_SSFAM", "LIB_FAM", "LIB_SFAM", "ÉLIGIBILITÉ_O_N"], "Qualification DVNI")
 
     if ok:
+        df_articles = df_articles.copy()
+        df_hier = df_hier.copy()
+        df_categ = df_categ.copy()
+        df_qualif = df_qualif.copy()
+
         # --- Jointure 1 : articles <- Hiérarchisation (sur SAP ID) ---
+        # Clés normalisées : évite les NaN silencieux si les types/espaces diffèrent
+        df_articles["_SAP_ID_key"] = normalize_key(df_articles["SAP ID"])
+        df_hier["_SAP_ID_key"] = normalize_key(df_hier["Sap ID/ Article"])
+
         cols_hier = [
-            "Sap ID/ Article", "Groupe Marché BDFR", "Id Categ BDFR", "Categ BDFR",
+            "_SAP_ID_key", "Groupe Marché BDFR", "Id Categ BDFR", "Categ BDFR",
             "Id Sous Categ BDFR", "Sous Categ BDFR", "Id Sous Sous Categ BDFR", "Sous Sous Categ BDFR",
             "Subcategory", "Libellé Brick BDFR", "Libellé secteur", "Code Rayon", "Libellé rayon",
             "code famille", "Libellé Famille", "Grpe march.", "Groupe de marchandises",
             "Code sous-famille", "Libellé sous-famille",
         ]
-        df = df_articles.merge(
-            df_hier[cols_hier], left_on="SAP ID", right_on="Sap ID/ Article", how="left"
-        )
+        df = df_articles.merge(df_hier[cols_hier], on="_SAP_ID_key", how="left")
         df = df.rename(columns={"Subcategory": "ID Brick_easier", "Libellé Brick BDFR": "Brick_easier"})
 
+        nb_non_matches_1 = df["Groupe Marché BDFR"].isna().sum()
+        if nb_non_matches_1 > 0:
+            st.warning(f"Jointure Articles ↔ Hiérarchisation : {nb_non_matches_1} article(s) sans correspondance.")
+
         # --- Jointure 2 : + Nouvelle catégorisation (sur ID Brick_easier <-> Id Brick) ---
+        df["_ID_BRICK_key"] = normalize_key(df["ID Brick_easier"])
+        df_categ["_ID_BRICK_key"] = normalize_key(df_categ["Id Brick"])
+
         df = df.merge(
-            df_categ[["Id Brick", "code_qualification", "libelle_qualification", "Marché", "Marché2"]],
-            left_on="ID Brick_easier", right_on="Id Brick", how="left",
+            df_categ[["_ID_BRICK_key", "code_qualification", "libelle_qualification", "Marché", "Marché2"]],
+            on="_ID_BRICK_key", how="left",
         )
 
+        nb_non_matches_2 = df["code_qualification"].isna().sum()
+        if nb_non_matches_2 > 0:
+            st.warning(f"Jointure Hiérarchisation ↔ Nouvelle catégorisation : {nb_non_matches_2} article(s) sans correspondance.")
+
         # --- Jointure 3 : + Qualification DVNI (sur code famille + Code sous-famille) ---
+        df["_FAM_key"] = normalize_key(df["code famille"])
+        df["_SFAM_key"] = normalize_key(df["Code sous-famille"])
+        df_qualif["_FAM_key"] = normalize_key(df_qualif["CODE_FAM"])
+        df_qualif["_SFAM_key"] = normalize_key(df_qualif["CODE_SFAM"])
+
         df = df.merge(
-            df_qualif[["CODE_FAM", "CODE_SFAM", "FAM_SSFAM", "LIB_FAM", "LIB_SFAM", "ÉLIGIBILITÉ_O_N"]],
-            left_on=["code famille", "Code sous-famille"], right_on=["CODE_FAM", "CODE_SFAM"], how="left",
+            df_qualif[["_FAM_key", "_SFAM_key", "FAM_SSFAM", "LIB_FAM", "LIB_SFAM", "ÉLIGIBILITÉ_O_N"]],
+            on=["_FAM_key", "_SFAM_key"], how="left",
         )
+
+        nb_non_matches_3 = df["ÉLIGIBILITÉ_O_N"].isna().sum()
+        if nb_non_matches_3 > 0:
+            st.warning(f"Jointure Hiérarchisation ↔ Qualification DVNI : {nb_non_matches_3} article(s) sans correspondance.")
 
         # --- Nettoyage : colonnes techniques ---
         drop_cols = [
-            "Sap ID/ Article", "Id Brick", "code famille", "Code sous-famille",
+            "_SAP_ID_key", "_ID_BRICK_key", "_FAM_key", "_SFAM_key",
+            "Id Brick", "code famille", "Code sous-famille",
             "Libellé Famille", "Groupe Marché BDFR", "Libellé sous-famille",
         ]
         df = df.drop(columns=[c for c in drop_cols if c in df.columns])
@@ -162,6 +203,8 @@ if df_enrichi is not None:
 
     df_c = df_enrichi.copy()
     df_c["libelle_qualification"] = df_c["libelle_qualification"].fillna("Non qualifié")
+    df_c["code_qualification"] = df_c["code_qualification"].fillna("NA")
+    df_c["ÉLIGIBILITÉ_O_N"] = df_c["ÉLIGIBILITÉ_O_N"].fillna("Non défini")
 
     group_cols = ["Plano grouping desc", "Segmentation"]
 
@@ -172,35 +215,41 @@ if df_enrichi is not None:
         .reset_index(name="Nombre")
     )
 
-    # 2. Somme par (groupe + code_qualification + libellé), éligibilité = celle du sous-groupe le plus fréquent
-    def eligibilite_majoritaire(sous_groupe):
-        return sous_groupe.loc[sous_groupe["Nombre"].idxmax(), "ÉLIGIBILITÉ_O_N"]
+    # 2. Somme par (groupe + code_qualification + libellé), éligibilité = celle du
+    #    sous-groupe le plus fréquent. Remplace l'ancien .apply(lambda g: pd.Series(...))
+    #    qui déclenche des avertissements/erreurs selon la version de pandas :
+    #    on trie par Nombre décroissant puis on prend la 1ère valeur d'éligibilité
+    #    rencontrée par groupe (= celle du sous-groupe majoritaire), de façon vectorisée.
+    comptage_trie = comptage.sort_values("Nombre", ascending=False)
+    somme_qualif = comptage_trie.groupby(
+        group_cols + ["code_qualification", "libelle_qualification"], dropna=False, as_index=False
+    ).agg(**{"sum": ("Nombre", "sum"), "ÉLIGIBILITÉ_O_N": ("ÉLIGIBILITÉ_O_N", "first")})
 
-    somme_qualif = (
-        comptage.groupby(group_cols + ["code_qualification", "libelle_qualification"], dropna=False)
-        .apply(lambda g: pd.Series({"sum": g["Nombre"].sum(), "ÉLIGIBILITÉ_O_N": eligibilite_majoritaire(g)}))
-        .reset_index()
-    )
+    if somme_qualif.empty:
+        st.warning("Aucune ligne à classifier (vérifiez les jointures de l'étape 2).")
+    else:
+        # 3. Pour chaque groupe (Plano+Segmentation), garder la ligne avec le plus grand "sum"
+        #    dropna=False ajouté ici aussi : sans ça, un couple Plano/Segmentation contenant
+        #    un NaN disparaissait silencieusement à cette dernière étape alors qu'il était
+        #    bien présent dans les étapes précédentes (incohérence avec le reste du groupby).
+        idx_max = somme_qualif.groupby(group_cols, dropna=False)["sum"].idxmax()
+        df_majoritaire = somme_qualif.loc[idx_max].reset_index(drop=True)
+        df_majoritaire = df_majoritaire.rename(
+            columns={
+                "code_qualification": "Code qualification",
+                "libelle_qualification": "Qualification",
+                "ÉLIGIBILITÉ_O_N": "Éligibilité",
+            }
+        ).drop(columns=["sum"])
 
-    # 3. Pour chaque groupe (Plano+Segmentation), garder la ligne avec le plus grand "sum"
-    idx_max = somme_qualif.groupby(group_cols)["sum"].idxmax()
-    df_majoritaire = somme_qualif.loc[idx_max].reset_index(drop=True)
-    df_majoritaire = df_majoritaire.rename(
-        columns={
-            "code_qualification": "Code qualification",
-            "libelle_qualification": "Qualification",
-            "ÉLIGIBILITÉ_O_N": "Éligibilité",
-        }
-    ).drop(columns=["sum"])
-
-    st.success(f"{len(df_majoritaire)} couples Plano/Segmentation classifiés")
-    st.dataframe(df_majoritaire, use_container_width=True)
-    st.download_button(
-        "Télécharger la classification Plano/Segmentation (CSV)",
-        df_majoritaire.to_csv(index=False).encode("utf-8-sig"),
-        file_name="classification_plano_segmentation.csv",
-        mime="text/csv",
-    )
+        st.success(f"{len(df_majoritaire)} couples Plano/Segmentation classifiés")
+        st.dataframe(df_majoritaire, use_container_width=True)
+        st.download_button(
+            "Télécharger la classification Plano/Segmentation (CSV)",
+            df_majoritaire.to_csv(index=False).encode("utf-8-sig"),
+            file_name="classification_plano_segmentation.csv",
+            mime="text/csv",
+        )
 
 # ============================================================
 # ÉTAPE 4 — Report sur le Plan de sol
@@ -254,19 +303,40 @@ if df_majoritaire is not None:
             )
             df_corr_work = df_corr_work.drop_duplicates(subset=["Plano", "Segmentation"])
 
-            df_plan_norm = df_plan_work.merge(df_corr_work, on=["Plano", "Segmentation"], how="left")
+            # Normalisation des clés brutes avant jointure (espaces/casse fréquents entre exports)
+            df_plan_work["_Plano_key"] = normalize_key(df_plan_work["Plano"])
+            df_plan_work["_Seg_key"] = normalize_key(df_plan_work["Segmentation"])
+            df_corr_work["_Plano_key"] = normalize_key(df_corr_work["Plano"])
+            df_corr_work["_Seg_key"] = normalize_key(df_corr_work["Segmentation"])
+
+            df_plan_norm = df_plan_work.merge(
+                df_corr_work[["_Plano_key", "_Seg_key", "Plano grouping desc", "Segmentation.1"]],
+                on=["_Plano_key", "_Seg_key"], how="left",
+            ).drop(columns=["_Plano_key", "_Seg_key"])
+
+            nb_non_normalises = df_plan_norm["Plano grouping desc"].isna().sum()
+            if nb_non_normalises > 0:
+                st.warning(
+                    f"{nb_non_normalises} ligne(s) du plan de sol sans correspondance dans la table "
+                    "de normalisation Plano/Segmentation."
+                )
         else:
             df_plan_norm = df_plan_work.copy()
             df_plan_norm["Plano grouping desc"] = df_plan_norm["Plano"]
             df_plan_norm["Segmentation.1"] = df_plan_norm["Segmentation"]
 
-        # Jointure finale avec la classification majoritaire
+        # Jointure finale avec la classification majoritaire (clés normalisées)
+        df_plan_norm["_Plano_key"] = normalize_key(df_plan_norm["Plano grouping desc"])
+        df_plan_norm["_Seg_key"] = normalize_key(df_plan_norm["Segmentation.1"])
+
+        df_majoritaire_key = df_majoritaire.copy()
+        df_majoritaire_key["_Plano_key"] = normalize_key(df_majoritaire_key["Plano grouping desc"])
+        df_majoritaire_key["_Seg_key"] = normalize_key(df_majoritaire_key["Segmentation"])
+
         df_final = df_plan_norm.merge(
-            df_majoritaire,
-            left_on=["Plano grouping desc", "Segmentation.1"],
-            right_on=["Plano grouping desc", "Segmentation"],
+            df_majoritaire_key[["_Plano_key", "_Seg_key", "Code qualification", "Qualification", "Éligibilité"]],
+            on=["_Plano_key", "_Seg_key"],
             how="left",
-            suffixes=("", "_classif"),
         )
 
         df_final_out = df_final[

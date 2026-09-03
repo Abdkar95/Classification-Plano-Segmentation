@@ -424,25 +424,31 @@ correspondance dans la classification validée (étape 3bis), dans cet ordre :
 
         df_correspondance_auto = st.session_state["df_correspondance_auto"]
 
-        nb_a_completer = (df_correspondance_auto["Code qualification"].astype(str).str.strip() == "").sum()
-        if nb_a_completer > 0:
+        mask_a_completer = df_correspondance_auto["Code qualification"].astype(str).str.strip() == ""
+        df_corr_trouvees = df_correspondance_auto.loc[~mask_a_completer]
+        df_corr_a_completer = df_correspondance_auto.loc[mask_a_completer]
+
+        if not df_corr_a_completer.empty:
             st.warning(
-                f"{nb_a_completer} couple(s) sur {len(df_correspondance_auto)} n'ont pas trouvé de "
-                "correspondance automatique (colonne « Méthode »). Complétez-les dans le tableau ci-dessous."
+                f"{len(df_corr_a_completer)} couple(s) sur {len(df_correspondance_auto)} n'ont pas trouvé de "
+                "correspondance automatique. Complétez uniquement ces lignes ci-dessous."
+            )
+            with st.expander(f"Voir les {len(df_corr_trouvees)} couple(s) déjà trouvé(s) automatiquement"):
+                st.dataframe(df_corr_trouvees, use_container_width=True)
+
+            edite_a_completer = st.data_editor(
+                df_corr_a_completer,
+                use_container_width=True,
+                num_rows="fixed",
+                key="editeur_correspondance",
+                disabled=["Plano (plan de sol)", "Segmentation (plan de sol)", "Méthode"],
             )
         else:
             st.success(f"Les {len(df_correspondance_auto)} couples du plan de sol ont tous trouvé une correspondance.")
-
-        correspondance_editee = st.data_editor(
-            df_correspondance_auto,
-            use_container_width=True,
-            num_rows="fixed",
-            key="editeur_correspondance",
-            disabled=["Plano (plan de sol)", "Segmentation (plan de sol)", "Méthode"],
-        )
+            edite_a_completer = df_corr_a_completer  # vide
 
         if st.button("Valider la table de correspondance"):
-            encore_vide = correspondance_editee["Code qualification"].astype(str).str.strip() == ""
+            encore_vide = edite_a_completer["Code qualification"].astype(str).str.strip() == ""
             if encore_vide.any():
                 st.error(
                     f"{int(encore_vide.sum())} ligne(s) encore incomplète(s). "
@@ -450,7 +456,9 @@ correspondance dans la classification validée (étape 3bis), dans cet ordre :
                     "« Qualification » et « Éligibilité » pour toutes les lignes avant de valider."
                 )
             else:
-                st.session_state["df_correspondance_validee"] = correspondance_editee.copy()
+                st.session_state["df_correspondance_validee"] = pd.concat(
+                    [df_corr_trouvees, edite_a_completer], ignore_index=True
+                )
                 st.session_state["correspondance_ok"] = True
                 st.session_state["df_plan_work"] = df_plan_work
                 st.success("Table de correspondance validée.")
